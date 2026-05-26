@@ -1,448 +1,123 @@
-#!/usr/bin/env perl
+#! /usr/bin/env perl
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  heater_controller.pl
-#  Stuurt een warmtestaaf aan op basis van solar-overproductie via MQTT.
-#
-#  Prioriteitsvolgorde:
-#    1. Acculader  (r4850g2)  — heeft altijd voorrang
-#    2. Warmtestaaf (r4875g1) — dit script, alleen actief als accu inactief
-#    3. Teruglevering (trucki) — blokkeert ook de warmtestaaf indien actief
-#
-#  Vereiste modules:
-#    cpanm Net::MQTT::Simple JSON::PP List::Util Time::HiRes Scalar::Util
-# ══════════════════════════════════════════════════════════════════════════════
+# charged: daemon die het laden van de Deye SE G5.1 Pro via Huawei R4850g2 regelt
 
 use strict;
 use warnings;
-use feature 'say';
-
 use Net::MQTT::Simple;
-use JSON::PP     qw(decode_json);
-use List::Util   qw(min max sum);
-use Time::HiRes  qw(time);
-use Scalar::Util qw(looks_like_number);
-use POSIX        qw(strftime);
+use JSON::MaybeXS qw(decode_json);
+use POSIX         qw(strftime floor);
+use Data::Dumper;
+use DateTime::Event::Sunrise;
+use List::Util    qw(min max sum);
+use Time::HiRes   qw(time);
+use Scalar::Util  qw(looks_like_number);
 
-# ── Configuratie ───────────────────────────────────────────────────────────────
-
-my %cfg = (
-
-    # MQTT broker
-    mqtt_host              => '10.2.2.20',
-    mqtt_port              => 1883,
-
-    # Regelinterval en stapgrootte
-    interval_sec           => 3,       # seconden tussen regelstappen
-    step_max_amps          => 2.0,     # maximale amperewijziging per stap
-
-    # Ampere-grenzen
-    amp_min                => 3.5,     # onder dit → uitschakelen
-    amp_max                => 25.0,    # nooit overschrijden
-
-    # Hysterese voor aan/uitschakelen (in Watt)
-    surplus_on_watts       => 200,     # minimaal surplus om in te schakelen
-    surplus_off_watts      => 50,      # surplus waarbij wordt uitgeschakeld
-                                       # (lager dan surplus_on => hysterese-kloof)
-
-    # Smoothing (voortschrijdend gemiddelde)
-    smooth_samples         => 3,       # aantal samples in het venster
-
-    # Dode band: publiceer amp_set alleen bij wijziging groter dan dit
-    amp_deadband           => 0.1,
-
-    # ── Emergency fast-ramp ──────────────────────────────────────────────────
-    # Als de ruwe (ongemiddelde) netafname deze drempel overschrijdt, wordt het
-    # amperage direct in één stap teruggebracht — zonder te wachten op de
-    # normale regelcyclus. Zo worden importpieken bij plotse bewolking snel
-    # afgevangen. Zet op 0 om uit te schakelen.
-    emergency_import_watts => 100,
-
-    # ── Coordinatie ──────────────────────────────────────────────────────────
-    # Drempel waaronder een apparaat als 'inactief' wordt beschouwd (Watt).
-    # Zowel acculader als teruglevering moeten BEIDE onder deze waarde liggen
-    # voordat de warmtestaaf mag inschakelen.
-    coordinator_idle_watts => 20,
-
-    # Ventilator-hysterese (graden Celsius)
-    fan_full_threshold     => 35,      # boven dit → vol toeren
-    fan_auto_threshold     => 33,      # onder dit → auto (2 gr kloof = hysterese)
-);
-
-# ── State ──────────────────────────────────────────────────────────────────────
-
-my %st = (
-    dc_voltage          => 58.0,   # fallback DC-spanning
-    temperature         => 0.0,
-    amp_set             => 0.0,    # huidig ingesteld ampere
-    heater_on           => 0,      # 1 = warmtestaaf is aan
-    fan_full            => 0,      # 1 = ventilator op vol toeren
-    last_regulate       => 0,      # tijdstip laatste regelstap
-
-    # Coordinatie: undef = topic nog nooit ontvangen.
-    # Veilige standaard: behandel als 'actief' totdat eerste waarde binnenkomt.
-    acculader_power     => undef,
-    teruglevering_power => undef,
-);
-
-# Smoothing-buffers (circulaire FIFO, max smooth_samples elementen)
-my @surplus_buf;    # berekend surplus in W (-Power_curr)
-my @ac_power_buf;   # AC-ingangsvermogen warmtestaaf in W
-
-# ── MQTT verbinding ────────────────────────────────────────────────────────────
-
-my $mqtt = Net::MQTT::Simple->new("$cfg{mqtt_host}:$cfg{mqtt_port}");
-
-$mqtt->subscribe(
-    # Energiemeter
-    'tele/energy_meter/SENSOR'                        => \&cb_energy_meter,
-
-    # Warmtestaaf voeding (r4875g1)
-    'r4875g1-mqtt/sensor/01_input_ac_power/state'     => \&cb_ac_power,
-    'r4875g1-mqtt/sensor/05_output_dc_power/state'    => \&cb_dc_power,
-    'r4875g1-mqtt/sensor/07_output_dc_voltage/state'  => \&cb_dc_voltage,
-    'r4875g1-mqtt/sensor/08_output_temperature/state' => \&cb_temperature,
-
-    # Coordinatie: acculader (prioriteit 1) en teruglevering (prioriteit 3)
-    'r4850g2-mqtt/sensor/01_input_ac_power/state'     => \&cb_acculader_power,
-    'trucki/sensor/ac_output/state'                   => \&cb_teruglevering_power,
-);
-
-log_info("Warmtestaaf-controller gestart  |  broker: $cfg{mqtt_host}:$cfg{mqtt_port}");
-log_info("Interval: $cfg{interval_sec}s  |  Stap max: $cfg{step_max_amps}A  |  "
-       . "Aan bij: $cfg{surplus_on_watts}W  |  Uit bij: $cfg{surplus_off_watts}W");
-log_info("Coordinatie: wacht op eerste data van acculader en teruglevering...");
-
-# ── Signaalafhandeling (nette afsluiting) ──────────────────────────────────────────
-
-sub shutdown_handler {
-    my ($sig) = @_;
-    log_info("Signaal SIG${sig} ontvangen — warmtestaaf uitschakelen en stoppen...");
-    fan_off();
-    heater_off();
-    log_info("Afgesloten.");
-    exit 0;
-}
-
-$SIG{INT}  = \&shutdown_handler;   # Ctrl-C
-$SIG{TERM} = \&shutdown_handler;   # systemctl stop / kill
-
-# ── Hoofdlus ───────────────────────────────────────────────────────────────────
-
-while (1) {
-    $mqtt->tick(1);   # verwerk MQTT-berichten, blokkeert max. 1 seconde
-
-    my $now = time();
-    if ($now - $st{last_regulate} >= $cfg{interval_sec}) {
-        regulate();
-        $st{last_regulate} = $now;
-    }
-}
+# Signaalafhandeling via %SIG (ingesteld na initialisatie van $mqtt)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MQTT-callbacks — energiemeter en warmtestaaf
+# 1. CONFIGURATIE & REGELPARAMETERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-sub cb_energy_meter {
-    my (undef, $payload) = @_;
-    my $data = eval { decode_json($payload) };
-    if ($@) {
-        log_warn("JSON parse fout energiemeter: $@");
-        return;
-    }
-    my $power = $data->{LK13BE}{Power_curr};
-    return unless defined $power && looks_like_number($power);
+# MQTT Topics
+my $mqtt_host               = "10.2.2.20";
+my $topic_input             = "tele/energy_meter/SENSOR";
+my $topic_output            = "home/canbus/amp_set";
+my $topic_off               = "home/canbus/can_off";
+my $topic_on                = "home/canbus/can_on";
+my $topic_ac_power          = "r4850g2-mqtt/sensor/01_input_ac_power/state";
+my $topic_dc_power          = "r4850g2-mqtt/sensor/05_output_dc_power/state";
+my $topic_voltage           = "r4850g2-mqtt/sensor/07_output_dc_voltage/state";
+my $topic_inverter_power    = "trucki/sensor/ac_output/state";
+my $topic_inverter_setpoint = "trucki/number/ac_setpoint_number/state";
+my $topic_temperature       = "r4850g2-mqtt/sensor/08_output_temperature/state";
+my $topic_fan_full          = "home/canbus/16_fan_full_speed_button/command";
+my $topic_fan_auto          = "r4850g2-mqtt/button/17_fan_auto_mode_button/command";
 
-    # Negatieve Power_curr = export naar net = positief surplus
-    my $surplus_raw = -$power;
-    push_smooth(\@surplus_buf, $surplus_raw);
+# ── PID-regelparameters ───────────────────────────────────────────────────────
+#
+#  Doel: houd Power_curr op TARGET_HOUSE_POWER (0 W).
+#  Positieve error = we verbruiken van het net → meer laden.
+#  Negatieve error = we leveren terug → minder laden.
+#
+#  KP  — Proportioneel: directe reactie op de afwijking.
+#         100 W afwijking × 0.010 = 1.0 A aanpassing.
+#
+#  KI  — Integraal: corrigeert aanhoudende kleine afwijking (steady-state fout).
+#         Elke seconde dat er een afwijking is, wordt 0.002 A/W opgebouwd.
+#         Te hoog → oscillatie; te laag → trage correctie.
+#
+#  KD  — Differentiaal: dempt snelle veranderingen (bijv. plotse bewolking).
+#         Reageert op de veranderingssnelheid van de error, NIET op de error zelf.
+#         0.005 A per W/s verandering.
+#         Te hoog → gevoelig voor ruis; gebruik smoothing om dat te beperken.
+#
+#  Aanbevolen startwaarden voor dit systeem (pas aan op basis van gedrag):
+#    KP = 0.010   KI = 0.002   KD = 0.005
 
-    # ── Emergency fast-ramp ──────────────────────────────────────────────────
-    # Gebruik de ruwe waarde (niet het gemiddelde) voor snelle reactie.
-    # Alleen actief als warmtestaaf aan is en coordinatie het toestaat.
-    if (   $cfg{emergency_import_watts} > 0
-        && $st{heater_on}
-        && $surplus_raw < -$cfg{emergency_import_watts} )
-    {
-        emergency_ramp($surplus_raw);
-    }
-}
+my $KP             = 0.010;  # Proportionele versterking  (A per W)
+my $KI             = 0.002;  # Integrale versterking      (A per W·s)
+my $KD             = 0.005;  # Differentiële versterking  (A per W/s)
 
-sub cb_ac_power {
-    my (undef, $payload) = @_;
-    return unless looks_like_number($payload);
-    push_smooth(\@ac_power_buf, $payload + 0);
-}
+# ── Overige regelparameters ───────────────────────────────────────────────────
 
-sub cb_dc_power {
-    # DC-outputvermogen warmtestaaf — voor diagnose / toekomstig gebruik
-}
+my $TARGET_HOUSE_POWER  = 0;    # Doel: netto huisverbruik (W)
+my $DEADBAND_WATT       = 50;   # Dode zone: binnen ±50 W geen actie
+my $MAX_STEP_AMP        = 2.0;  # Max. stroomwijziging per stap (anti-oscillatie)
+my $MAX_AMP             = 35;   # Maximale laadstroom (A)
+my $MIN_AMP_SET         = 1;    # Minimale instelbare stroom (A)
+my $INTEGRAL_MAX        = 10.0; # Anti-windup: integraalterm begrensd op ±10 A
+my $SMOOTH_SAMPLES      = 3;    # Voortschrijdend gemiddelde (ruisonderdrukking)
+my $cutoff_voltage      = 57.0; # Accuspanning waarbij laden stopt (V)
+my $lat                 = 51.7073;
+my $long                = 6.07519;
+my $FAN_FULL_THRESHOLD  = 35;   # Boven deze temperatuur (°C) → ventilator vol toeren
+my $FAN_AUTO_THRESHOLD  = 33;   # Onder deze temperatuur (°C) → ventilator auto (2°C hysterese)
 
-sub cb_dc_voltage {
-    my (undef, $payload) = @_;
-    return unless looks_like_number($payload) && $payload > 10;
-    $st{dc_voltage} = $payload + 0;
-}
+# ── Globale statusvariabelen ──────────────────────────────────────────────────
 
-sub cb_temperature {
-    my (undef, $payload) = @_;
-    return unless looks_like_number($payload);
-    $st{temperature} = $payload + 0;
-    regulate_fan();
-}
+my $current_house_power = 0;
+my $charger_ac_power    = 0;
+my $charger_dc_power    = 0;
+my $charger_voltage     = 0;
+my $inv_power           = 0;
+my $inv_setpoint        = 0;
+my $last_amp_set        = $MIN_AMP_SET;
+my $charger_is_on       = 0;
+my $shutdown_flag       = 0;
+my $charger_temperature = 0.0;  # Lader temperatuur (°C)
+my $fan_full            = 0;    # 1 = ventilator op vol toeren
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MQTT-callbacks — coordinatie
-# ══════════════════════════════════════════════════════════════════════════════
+# ── PID-toestandsvariabelen ───────────────────────────────────────────────────
 
-sub cb_acculader_power {
-    my (undef, $payload) = @_;
-    return unless looks_like_number($payload);
+my $pid_integral        = 0.0;  # Opgebouwde integraalterm (A)
+my $pid_last_error      = 0.0;  # Error van vorige stap (voor D-term)
+my $pid_last_time       = time(); # Tijdstip vorige stap (voor dt)
 
-    my $prev       = $st{acculader_power};
-    my $idle       = $cfg{coordinator_idle_watts};
-    $st{acculader_power} = $payload + 0;
+# ── Smoothing-buffer (voortschrijdend gemiddelde op Power_curr) ───────────────
 
-    my $was_active = defined($prev) && $prev >= $idle;
-    my $is_active  = $st{acculader_power} >= $idle;
-
-    if (!$was_active && $is_active) {
-        log_info(sprintf "Acculader ACTIEF (%.0fW >= %dW) — warmtestaaf geblokkeerd",
-            $st{acculader_power}, $idle);
-        if ($st{heater_on}) {
-            log_info("Acculader gestart terwijl warmtestaaf aan was → direct UIT (prioriteit 1)");
-            heater_off();
-        }
-    }
-    elsif ($was_active && !$is_active) {
-        log_info(sprintf "Acculader INACTIEF (%.0fW < %dW) — blokkade opgeheven",
-            $st{acculader_power}, $idle);
-    }
-}
-
-sub cb_teruglevering_power {
-    my (undef, $payload) = @_;
-    return unless looks_like_number($payload);
-
-    my $prev       = $st{teruglevering_power};
-    my $idle       = $cfg{coordinator_idle_watts};
-    $st{teruglevering_power} = $payload + 0;
-
-    my $was_active = defined($prev) && $prev >= $idle;
-    my $is_active  = $st{teruglevering_power} >= $idle;
-
-    if (!$was_active && $is_active) {
-        log_info(sprintf "Teruglevering ACTIEF (%.0fW >= %dW) — warmtestaaf geblokkeerd",
-            $st{teruglevering_power}, $idle);
-        if ($st{heater_on}) {
-            log_info("Teruglevering gestart terwijl warmtestaaf aan was → direct UIT");
-            heater_off();
-        }
-    }
-    elsif ($was_active && !$is_active) {
-        log_info(sprintf "Teruglevering INACTIEF (%.0fW < %dW) — blokkade opgeheven",
-            $st{teruglevering_power}, $idle);
-    }
-}
+my @power_buf;
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Coordinatie-check
+# 2. HULPFUNCTIES
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Geeft 1 terug als de warmtestaaf mag draaien, anders 0.
-# Zolang een topic nog nooit ontvangen is (undef) geldt dat apparaat als
-# 'mogelijk actief' — veilige standaard, voorkomt conflict bij opstart.
-sub coordinator_allows {
-    my $idle = $cfg{coordinator_idle_watts};
-
-    unless (defined $st{acculader_power}) {
-        log_info("Coordinatie: wacht nog op eerste acculader-meting") if !$st{heater_on};
-        return 0;
-    }
-    if ($st{acculader_power} >= $idle) {
-        return 0;
-    }
-
-    unless (defined $st{teruglevering_power}) {
-        log_info("Coordinatie: wacht nog op eerste teruglevering-meting") if !$st{heater_on};
-        return 0;
-    }
-    if ($st{teruglevering_power} >= $idle) {
-        return 0;
-    }
-
-    return 1;
+sub log_status {
+    my ($message, $data) = @_;
+    my $ts = strftime "%Y-%m-%d %H:%M:%S", localtime;
+    print "charged [$ts] $message\n";
+    print "charged [$ts] DEBUG: " . Dumper($data) if defined $data;
 }
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Regellogica
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Emergency fast-ramp
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Wordt aangeroepen vanuit cb_energy_meter bij een ruwe importpiek.
-# Berekent direct het gewenste ampere op basis van het actuele AC-verbruik
-# van de staaf min het import-overschot, en publiceert dat onmiddellijk.
-# De normale regelcyclus loopt daarna gewoon door en verfijnt verder.
-sub emergency_ramp {
-    my ($surplus_raw) = @_;   # negatief = we importeren
-
-    my $ac_power = avg(\@ac_power_buf) // 0;
-    my $voltage  = $st{dc_voltage};
-
-    # Doelvermogen = huidig AC-verbruik + surplus_raw (surplus_raw is negatief)
-    # We trekken het import-overschot direct van het verbruik af.
-    my $target_watts = $ac_power + $surplus_raw;
-    my $target_amps  = clamp($target_watts / $voltage, $cfg{amp_min}, $cfg{amp_max});
-    my $amp_int      = int($target_amps);
-
-    log_info(sprintf
-        "EMERGENCY ramp: import=%.0fW  ac=%.0fW  target=%.0fW  amp: %.1fA -> %dA",
-        -$surplus_raw, $ac_power, $target_watts, $st{amp_set}, $amp_int
-    );
-
-    $st{amp_set} = $target_amps;
-    $mqtt->publish('home/canbus75/amp_set', $amp_int);
-
-    # Reset de smoothing-buffer zodat de normale regelaar aansluit op de
-    # nieuwe toestand en niet probeert terug te regelen naar het oude gemiddelde.
-    @surplus_buf = ($surplus_raw);
-}
-
-sub regulate {
-    my $surplus  = avg(\@surplus_buf)  // 0;
-    my $ac_power = avg(\@ac_power_buf) // 0;
-    my $voltage  = $st{dc_voltage};
-    my $allowed  = coordinator_allows();
-
-    log_info(sprintf
-        "surplus=%+.0fW  ac=%.0fW  volt=%.1fV  amp=%.1fA  aan=%s  "
-      . "temp=%.1f°C  accu=%.0fW  terug=%.0fW  toegestaan=%s",
-        $surplus, $ac_power, $voltage, $st{amp_set},
-        ($st{heater_on} ? 'JA' : 'NEE'),
-        $st{temperature},
-        $st{acculader_power}     // -1,
-        $st{teruglevering_power} // -1,
-        ($allowed ? 'JA' : 'NEE')
-    );
-
-    # ── Coordinatie-blokkade ───────────────────────────────────────────────────
-    unless ($allowed) {
-        if ($st{heater_on}) {
-            log_info("Coordinatie: blokkade actief → warmtestaaf UIT");
-            heater_off();
-	    fan_off();
-        }
-        return;
-    }
-
-    # ── Inschakelen (met hysterese) ────────────────────────────────────────────
-    unless ($st{heater_on}) {
-        if ($surplus >= $cfg{surplus_on_watts}) {
-            log_info("Surplus ${surplus}W >= $cfg{surplus_on_watts}W en coordinatie OK → AAN");
-            heater_on();
-        }
-        return;
-    }
-
-    # ── Proportionele regelstap (P-regelaar met stapbeperking) ─────────────────
-    #
-    # surplus > 0  =>  we exporteren nog, meer vermogen kan er bij
-    # surplus < 0  =>  we importeren, vermogen moet omlaag
-    # Deling door spanning geeft de benodigde ampere-wijziging.
-    # step_max_amps begrenst de maximale wijziging per stap (anti-oscillatie).
-
-    my $delta_amps = clamp(
-        $surplus / $voltage,
-        -$cfg{step_max_amps},
-         $cfg{step_max_amps}
-    );
-
-    my $new_amp = clamp(
-        $st{amp_set} + $delta_amps,
-        $cfg{amp_min},
-        $cfg{amp_max}
-    );
-
-    # ── Uitschakelen (met hysterese) ───────────────────────────────────────────
-    # Schakel uit als we op minimum zitten en het surplus te laag is.
-    # surplus_off_watts < surplus_on_watts zorgt voor de hysterese-kloof.
-    if ($st{amp_set} <= $cfg{amp_min} && $surplus <= $cfg{surplus_off_watts}) {
-        log_info(sprintf "Op minimum %.1fA en surplus %.0fW <= %dW → UIT",
-            $cfg{amp_min}, $surplus, $cfg{surplus_off_watts});
-        heater_off();
-        return;
-    }
-
-    # ── Nieuw setpoint publiceren (alleen bij betekenisvolle wijziging) ─────────
-    if (abs($new_amp - $st{amp_set}) >= $cfg{amp_deadband}) {
-        $st{amp_set} = $new_amp;
-        my $amp_int = int($new_amp);   # voeding accepteert alleen integers; naar beneden afronden
-        log_info(sprintf "amp_set -> %dA  (intern %.2fA, delta %+.2fA)", $amp_int, $new_amp, $delta_amps);
-        $mqtt->publish('home/canbus75/amp_set', $amp_int);
-    }
-}
-
-# ── Warmtestaaf aan/uit ───────────────────────────────────────────────────────
-
-sub heater_on {
-    $st{heater_on} = 1;
-    $st{amp_set}   = $cfg{amp_min};
-
-    # Zet eerst het ampere, dan inschakelen (veilig opstarten)
-    my $amp_int = int($cfg{amp_min});
-    $mqtt->publish('home/canbus75/amp_set', $amp_int);
-    $mqtt->publish('home/canbus75/can_on', '1');
-    log_info("-> MQTT: amp_set=${amp_int}A, can_on=1");
-}
-
-sub heater_off {
-    $st{heater_on} = 0;
-    $st{amp_set}   = 0.0;
-
-    $mqtt->publish('home/canbus75/can_off', '1');
-    log_info("-> MQTT: can_off=1");
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Ventilatorregeling
-# ══════════════════════════════════════════════════════════════════════════════
-
-sub regulate_fan {
-    my $temp = $st{temperature};
-
-    if (!$st{fan_full} && $temp > $cfg{fan_full_threshold}) {
-        log_info(sprintf "Temp %.1f gr > %d gr → Ventilator VOL TOEREN",
-            $temp, $cfg{fan_full_threshold});
-        $mqtt->publish('home/canbus75/16_fan_full_speed_button/command', 'PRESS');
-        $st{fan_full} = 1;
-    }
-    elsif ($st{fan_full} && $temp < $cfg{fan_auto_threshold}) {
-        log_info(sprintf "Temp %.1f gr < %d gr → Ventilator AUTO",
-            $temp, $cfg{fan_auto_threshold});
-	fan_auto();
-        $st{fan_full} = 0;
-    }
-}
-
-sub fan_auto {
-        $mqtt->publish('r4875g1-mqtt/button/17_fan_auto_mode_button/command', 'PRESS');
-}
-# ══════════════════════════════════════════════════════════════════════════════
-# Hulpfuncties
-# ══════════════════════════════════════════════════════════════════════════════
 
 sub push_smooth {
     my ($buf, $val) = @_;
     push @$buf, $val;
-    shift @$buf if @$buf > $cfg{smooth_samples};
+    shift @$buf if @$buf > $SMOOTH_SAMPLES;
 }
 
-sub avg {
+sub buf_avg {
     my ($buf) = @_;
-    return undef unless @$buf;
+    return 0 unless @$buf;
     return sum(@$buf) / scalar(@$buf);
 }
 
@@ -451,54 +126,292 @@ sub clamp {
     return max($lo, min($hi, $val));
 }
 
-sub log_info {
-    my ($msg) = @_;
-    printf "[%s] INFO  %s\n", _ts(), $msg;
+sub turn_off_charger {
+    my ($mqtt) = @_;
+    if ($charger_is_on) {
+        log_status("Lader UIT — laadstroom reset naar $MIN_AMP_SET A.");
+        $mqtt->publish($topic_off    => '1');
+        $mqtt->publish($topic_output => $MIN_AMP_SET);
+        $last_amp_set  = $MIN_AMP_SET;
+        $charger_is_on = 0;
+        # PID alleen resetten bij daadwerkelijk uitschakelen,
+        # niet bij elke aanroep als de lader al uit is.
+        _reset_pid();
+    }
 }
 
-sub log_warn {
-    my ($msg) = @_;
-    printf "[%s] WARN  %s\n", _ts(), $msg;
+sub turn_on_charger {
+    my ($mqtt) = @_;
+    unless ($charger_is_on) {
+        log_status("Lader AAN.");
+        $mqtt->publish($topic_on => '1');
+        $charger_is_on = 1;
+    }
 }
 
-sub _ts { strftime("%Y-%m-%d %H:%M:%S", localtime) }
+sub _reset_pid {
+    $pid_integral   = 0.0;
+    $pid_last_error = 0.0;
+    $pid_last_time  = time();
+    log_status("PID reset: integraal en vorige error gewist.");
+}
 
-__END__
+sub make_clean_exit {
+    my ($mqtt) = @_;
+    return sub {
+        my ($signame) = @_;
+        return if $shutdown_flag;
+        $shutdown_flag = 1;
+        warn "Signaal '$signame' ontvangen — nette afsluiting...\n";
+        fan_off($mqtt);
+        turn_off_charger($mqtt);
+        $mqtt->publish($topic_output => $MIN_AMP_SET);
+        exit(0);
+    };
+}
 
-=head1 NAME
+# ── Ventilatorregeling ────────────────────────────────────────────────────────
 
-heater_controller.pl - MQTT-gestuurde warmtestaaf op basis van solar-overproductie
+sub regulate_fan {
+    my ($mqtt) = @_;
+    my $temp = $charger_temperature;
 
-=head1 SYNOPSIS
+    if (!$fan_full && $temp > $FAN_FULL_THRESHOLD) {
+        log_status(sprintf "Temp %.1f°C > %d°C → Ventilator VOL TOEREN.", $temp, $FAN_FULL_THRESHOLD);
+        $mqtt->publish($topic_fan_full => 'PRESS');
+        $fan_full = 1;
+    }
+    elsif ($fan_full && $temp < $FAN_AUTO_THRESHOLD) {
+        log_status(sprintf "Temp %.1f°C < %d°C → Ventilator AUTO.", $temp, $FAN_AUTO_THRESHOLD);
+        fan_off($mqtt);
+    }
+}
 
-    perl heater_controller.pl
+sub fan_off {
+    my ($mqtt) = @_;
+    $mqtt->publish($topic_fan_auto => 'PRESS');
+    $fan_full = 0;
+}
 
-=head1 BESCHRIJVING
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. PID-REGELAAR
+# ══════════════════════════════════════════════════════════════════════════════
 
-Leest de netto netstroom via MQTT en stuurt een warmtestaaf aan met de
-beschikbare overproductie van een solar-installatie.
+sub pid_calculate {
+    my ($error) = @_;
 
-Prioriteitsvolgorde:
-  1. Acculader (r4850g2)    - heeft altijd voorrang; blokkeert warmtestaaf
-  2. Warmtestaaf (r4875g1)  - dit script (prioriteit 2)
-  3. Teruglevering (trucki) - blokkeert ook warmtestaaf indien actief
+    my $now = time();
+    my $dt  = $now - $pid_last_time;
 
-Regeling:
-  - Power_curr < 0          => overproductie beschikbaar
-  - P-regelaar met stapbeperking en voortschrijdend gemiddelde
-  - Hysterese aan/uit: apart in- en uitschakeldrempel
-  - Minimumampere: onder 4A wordt de staaf uitgeschakeld
-  - Ventilatorregeling met 2 grC hysterese-kloof
-  - Veilige opstart: geblokkeerd totdat eerste data van beide coordinatietopics
-    ontvangen is
+    # Minimale tijdstap: voorkom deling door nul en extreme D-waarden
+    # bij berichten die te snel achter elkaar komen.
+    $dt = 0.1 if $dt < 0.1;
 
-=head1 VEREISTE MODULES
+    # ── P-term ────────────────────────────────────────────────────────────────
+    my $p_term = $KP * $error;
 
-    cpanm Net::MQTT::Simple JSON::PP List::Util Time::HiRes Scalar::Util
+    # ── I-term (met anti-windup) ───────────────────────────────────────────────
+    $pid_integral += $error * $dt;
+    $pid_integral  = clamp($pid_integral, -$INTEGRAL_MAX / $KI, $INTEGRAL_MAX / $KI);
+    my $i_term     = $KI * $pid_integral;
 
-=head1 CONFIGURATIE
+    # ── D-term (op error-verandering, niet op setpoint-sprong) ────────────────
+    my $d_error = ($error - $pid_last_error) / $dt;
+    my $d_term  = $KD * $d_error;
 
-Pas het C<%cfg>-hash bovenaan het script aan.
+    # ── Totale uitgang ─────────────────────────────────────────────────────────
+    # error > 0 = we verbruiken van net → lader moet meer stroom leveren → positief
+    # error < 0 = we exporteren        → lader moet minder            → negatief
+    my $output = $p_term + $i_term + $d_term;
 
-=cut
+    log_status(sprintf
+        "PID: error=%+.1fW  dt=%.2fs  " .
+        "P=%+.3fA  I=%+.3fA (integraal=%.2f)  D=%+.3fA  uitgang=%+.3fA",
+        $error, $dt, $p_term, $i_term, $pid_integral, $d_term, $output
+    );
 
+    # Bewaar toestand voor volgende stap
+    $pid_last_error = $error;
+    $pid_last_time  = $now;
+
+    return $output;
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. HOOFD REGELFUNCTIE
+# ══════════════════════════════════════════════════════════════════════════════
+
+sub regulate_charger {
+    my ($mqtt) = @_;
+
+    # ── Blokkeer laden als inverter teruglevering uit accu doet ───────────────
+    if ($inv_setpoint > 0) {
+        log_status("Inverter teruglevering actief ($inv_setpoint W) → lader UIT.");
+        turn_off_charger($mqtt);
+        return;
+    }
+
+    # ── Efficiëntie (voor logging) ─────────────────────────────────────────────
+    my $efficiency = ($charger_ac_power > 0 && $charger_dc_power > 0)
+        ? min(1.0, $charger_dc_power / $charger_ac_power)
+        : 1.0;
+    log_status(sprintf
+        "Status: eff=%.3f  AC=%.0fW  DC=%.0fW  U=%.1fV  temp=%.1f°C  inv=%.0fW",
+        $efficiency, $charger_ac_power, $charger_dc_power,
+        $charger_voltage, $charger_temperature, $inv_setpoint
+    );
+
+    # ── Smoothed huisverbruik ─────────────────────────────────────────────────
+    my $smoothed_power = buf_avg(\@power_buf);
+    my $error = $smoothed_power - $TARGET_HOUSE_POWER;
+    log_status(sprintf
+        "Huisverbruik: ruw=%.0fW  gemiddeld=%.0fW  error=%+.0fW",
+        $current_house_power, $smoothed_power, $error
+    );
+
+    # ── Deadband ──────────────────────────────────────────────────────────────
+    if (abs($error) <= $DEADBAND_WATT) {
+        log_status("Binnen deadband (±${DEADBAND_WATT}W) — geen regelactie.");
+        # Lader uitschakelen alleen als hij aan is maar geen noemenswaardig
+        # vermogen levert (bijv. net opgestart of net onder minimumgrens).
+        # Als de lader gewoon laadt (AC > 50W), laten we hem met rust.
+        if ($charger_is_on && $charger_ac_power < 50) {
+            log_status("Lader aan maar nauwelijks actief (${charger_ac_power}W) → UIT.");
+            turn_off_charger($mqtt);
+        }
+        return;
+    }
+
+    # ── PID berekening ─────────────────────────────────────────────────────────
+    my $pid_output = pid_calculate($error);
+
+    # ── Staplimiet ────────────────────────────────────────────────────────────
+    my $step = clamp($pid_output, -$MAX_STEP_AMP, $MAX_STEP_AMP);
+    if (abs($pid_output) > $MAX_STEP_AMP) {
+        log_status(sprintf "Staplimiet: PID=%.3fA begrensd tot %.1fA.", $pid_output, $step);
+    }
+
+    # ── Nieuwe stroom ──────────────────────────────────────────────────────────
+    my $new_amp = clamp($last_amp_set + $step, $MIN_AMP_SET, $MAX_AMP);
+    $new_amp    = int($new_amp + 0.5);  # Afronden naar hele ampère
+
+    # ── Zon- en voltage-controles ─────────────────────────────────────────────
+    my $dt_now  = DateTime->now(time_zone => 'Europe/Amsterdam');
+    my $sun     = DateTime::Event::Sunrise->new(
+        longitude => $long, latitude => $lat, precise => 1
+    );
+    my $sunrise = $sun->sunrise_datetime($dt_now);
+    my $sunset  = $sun->sunset_datetime($dt_now);
+
+    my $below_min    = $new_amp <= $MIN_AMP_SET;
+    my $voltage_full = $charger_voltage >= $cutoff_voltage;
+    my $no_sun       = ($dt_now < $sunrise || $dt_now > $sunset);
+
+    if ($below_min || $voltage_full || $no_sun) {
+        log_status(
+            "Lader UIT: " .
+            ($below_min    ? "stroom te laag (${new_amp}A). "                          : "") .
+            ($voltage_full ? "accu vol (${charger_voltage}V >= ${cutoff_voltage}V). "  : "") .
+            ($no_sun       ? "buiten zonuren. "                                         : "")
+        );
+        turn_off_charger($mqtt);  # reset PID ook
+        return;
+    }
+
+    # ── Anti-windup: begrens integraal als output al geclamped is ─────────────
+    # Als we op MAX_AMP zitten en de error is nog steeds positief (of andersom),
+    # stop dan met het ophopen van de integraal.
+    if ($new_amp >= $MAX_AMP && $error > 0) {
+        $pid_integral = clamp($pid_integral, -$INTEGRAL_MAX / $KI, 0);
+        log_status("Anti-windup: op MAX_AMP, integraal niet verder ophogen.");
+    }
+    elsif ($new_amp <= $MIN_AMP_SET && $error < 0) {
+        $pid_integral = clamp($pid_integral, 0, $INTEGRAL_MAX / $KI);
+        log_status("Anti-windup: op MIN_AMP, integraal niet verder verlagen.");
+    }
+
+    # ── Lader AAN en publiceren ────────────────────────────────────────────────
+    turn_on_charger($mqtt);
+
+    if ($new_amp != $last_amp_set) {
+        log_status("Laadstroom: ${last_amp_set}A → ${new_amp}A.");
+        $mqtt->publish($topic_output => $new_amp);
+        $last_amp_set = $new_amp;
+    } else {
+        log_status("Laadstroom ongewijzigd: ${last_amp_set}A.");
+    }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. MQTT DAEMON LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+
+my $mqtt = Net::MQTT::Simple->new($mqtt_host);
+log_status("Verbonden met MQTT-broker op $mqtt_host.");
+
+$mqtt->last_will($topic_off => '1');
+
+my $exit_handler = make_clean_exit($mqtt);
+$SIG{INT}  = $exit_handler;
+$SIG{TERM} = $exit_handler;
+
+$mqtt->subscribe(
+
+    $topic_input => sub {
+        my ($topic, $message) = @_;
+        eval {
+            my $json = decode_json($message);
+            my $power = $json->{LK13BE}{Power_curr};
+            if (defined $power && looks_like_number($power)) {
+                $current_house_power = $power + 0;
+                push_smooth(\@power_buf, $current_house_power);
+                regulate_charger($mqtt);
+            } else {
+                log_status("Fout: kon Power_curr niet parsen.", \$json);
+            }
+        };
+        log_status("JSON-decodefout: $@") if $@;
+    },
+
+    $topic_ac_power => sub {
+        my (undef, $msg) = @_;
+        $charger_ac_power = $msg + 0 if looks_like_number($msg);
+    },
+
+    $topic_dc_power => sub {
+        my (undef, $msg) = @_;
+        $charger_dc_power = $msg + 0 if looks_like_number($msg);
+    },
+
+    $topic_voltage => sub {
+        my (undef, $msg) = @_;
+        $charger_voltage = $msg + 0 if looks_like_number($msg);
+    },
+
+    $topic_inverter_power => sub {
+        my (undef, $msg) = @_;
+        $inv_power = $msg + 0 if looks_like_number($msg);
+    },
+
+    $topic_inverter_setpoint => sub {
+        my (undef, $msg) = @_;
+        return unless looks_like_number($msg);
+        my $prev = $inv_setpoint;
+        $inv_setpoint = $msg + 0;
+        log_status("Inverter setpoint: ${prev}W → ${inv_setpoint}W.")
+            if $prev != $inv_setpoint;
+    },
+
+    $topic_temperature => sub {
+        my (undef, $msg) = @_;
+        return unless looks_like_number($msg);
+        $charger_temperature = $msg + 0;
+        regulate_fan($mqtt);
+    },
+
+);
+
+log_status("Start MQTT-luisterlus...");
+$mqtt->run();
+
+1;
