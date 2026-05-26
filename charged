@@ -31,7 +31,7 @@ my $topic_voltage           = "r4850g2-mqtt/sensor/07_output_dc_voltage/state";
 my $topic_inverter_power    = "trucki/sensor/ac_output/state";
 my $topic_inverter_setpoint = "trucki/number/ac_setpoint_number/state";
 my $topic_temperature       = "r4850g2-mqtt/sensor/08_output_temperature/state";
-my $topic_fan_full          = "home/canbus/16_fan_full_speed_button/command";
+my $topic_fan_full          = "r4850g2-mqtt/button/16_fan_full_speed_button/command";
 my $topic_fan_auto          = "r4850g2-mqtt/button/17_fan_auto_mode_button/command";
 
 # ── PID-regelparameters ───────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ sub make_clean_exit {
         return if $shutdown_flag;
         $shutdown_flag = 1;
         warn "Signaal '$signame' ontvangen — nette afsluiting...\n";
-        fan_off($mqtt);
+        fan_auto($mqtt);
         turn_off_charger($mqtt);
         $mqtt->publish($topic_output => $MIN_AMP_SET);
         exit(0);
@@ -183,11 +183,11 @@ sub regulate_fan {
     }
     elsif ($fan_full && $temp < $FAN_AUTO_THRESHOLD) {
         log_status(sprintf "Temp %.1f°C < %d°C → Ventilator AUTO.", $temp, $FAN_AUTO_THRESHOLD);
-        fan_off($mqtt);
+        fan_auto($mqtt);
     }
 }
 
-sub fan_off {
+sub fan_auto {
     my ($mqtt) = @_;
     $mqtt->publish($topic_fan_auto => 'PRESS');
     $fan_full = 0;
