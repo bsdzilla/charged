@@ -56,8 +56,8 @@ my $topic_fan_auto          = "r4850g2-mqtt/button/17_fan_auto_mode_button/comma
 #    KP = 0.010   KI = 0.002   KD = 0.005
 
 my $KP             = 0.010;  # Proportionele versterking  (A per W)
-my $KI             = 0.002;  # Integrale versterking      (A per W·s)
-my $KD             = 0.005;  # Differentiële versterking  (A per W/s)
+my $KI             = 0.0002;  # Integrale versterking      (A per W·s)
+my $KD             = 0.002;  # Differentiële versterking  (A per W/s)
 
 # ── Overige regelparameters ───────────────────────────────────────────────────
 
@@ -66,7 +66,8 @@ my $DEADBAND_WATT       = 50;   # Dode zone: binnen ±50 W geen actie
 my $MAX_STEP_AMP        = 2.0;  # Max. stroomwijziging per stap (anti-oscillatie)
 my $MAX_AMP             = 35;   # Maximale laadstroom (A)
 my $MIN_AMP_SET         = 1;    # Minimale instelbare stroom (A)
-my $INTEGRAL_MAX        = 10.0; # Anti-windup: integraalterm begrensd op ±10 A
+my $INTEGRAL_MAX        = 5.0; # Anti-windup: integraalterm begrensd op ±10 A
+my $DT_MAX		= 12.0;
 my $SMOOTH_SAMPLES      = 3;    # Voortschrijdend gemiddelde (ruisonderdrukking)
 my $cutoff_voltage      = 57.0; # Accuspanning waarbij laden stopt (V)
 my $lat                 = 51.7073;
@@ -208,16 +209,18 @@ sub pid_calculate {
     $dt = 0.1 if $dt < 0.1;
 
     # ── P-term ────────────────────────────────────────────────────────────────
-    my $p_term = $KP * $error;
-
+    my $p_term = -$KP * $error;
+    $dt = $DT_MAX if $dt > $DT_MAX;
     # ── I-term (met anti-windup) ───────────────────────────────────────────────
-    $pid_integral += $error * $dt;
+    if ($charger_is_on) {
+    	$pid_integral += $error * $dt;
+    }
     $pid_integral  = clamp($pid_integral, -$INTEGRAL_MAX / $KI, $INTEGRAL_MAX / $KI);
-    my $i_term     = $KI * $pid_integral;
+    my $i_term     = -$KI * $pid_integral;
 
     # ── D-term (op error-verandering, niet op setpoint-sprong) ────────────────
     my $d_error = ($error - $pid_last_error) / $dt;
-    my $d_term  = $KD * $d_error;
+    my $d_term  = -$KD * $d_error;
 
     # ── Totale uitgang ─────────────────────────────────────────────────────────
     # error > 0 = we verbruiken van net → lader moet meer stroom leveren → positief
