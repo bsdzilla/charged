@@ -1,7 +1,5 @@
 #! /usr/bin/env perl
 
-# charged: daemon die het laden van de Deye SE G5.1 Pro via Huawei R4850g2 regelt
-
 use strict;
 use warnings;
 use Net::MQTT::Simple;
@@ -55,19 +53,24 @@ my $topic_fan_auto          = "r4850g2-mqtt/button/17_fan_auto_mode_button/comma
 #  Aanbevolen startwaarden voor dit systeem (pas aan op basis van gedrag):
 #    KP = 0.010   KI = 0.002   KD = 0.005
 
-my $KP             = 0.010;  # Proportionele versterking  (A per W)
+my $KP             = 0.010;   # Proportionele versterking  (A per W)
 my $KI             = 0.0002;  # Integrale versterking      (A per W·s)
-my $KD             = 0.002;  # Differentiële versterking  (A per W/s)
+                               #   Was 0.002 → bij 200W/10s gaf dat 4A/stap (te snel)
+                               #   Nu  0.0002 → 200W/10s = 0.4A/stap (stabiel)
+my $KD             = 0.002;   # Differentiële versterking  (A per W/s)
+                               #   Verlaagd: D had weinig effect maar versterkte ruis
 
-# ── Overige regelparameters ───────────────────────────────────────────────────
+# ── Overige regelparameters ──────────────────────────────────────────────
 
 my $TARGET_HOUSE_POWER  = 0;    # Doel: netto huisverbruik (W)
 my $DEADBAND_WATT       = 50;   # Dode zone: binnen ±50 W geen actie
 my $MAX_STEP_AMP        = 2.0;  # Max. stroomwijziging per stap (anti-oscillatie)
-my $MAX_AMP             = 35;   # Maximale laadstroom (A)
+my $MAX_AMP             = 39;   # Maximale laadstroom (A)
 my $MIN_AMP_SET         = 1;    # Minimale instelbare stroom (A)
-my $INTEGRAL_MAX        = 5.0; # Anti-windup: integraalterm begrensd op ±10 A
-my $DT_MAX		= 12.0;
+my $INTEGRAL_MAX        = 5.0;  # Anti-windup: integraalterm begrensd op ±5 A
+                                 #   Was ±10A: te groot, liet integraal te ver ophopen
+my $DT_MAX              = 12.0; # Max. dt voor integraalberekening (seconden)
+                                 #   Voorkomt dat een deadband-cyclus de dt verdubbelt
 my $SMOOTH_SAMPLES      = 3;    # Voortschrijdend gemiddelde (ruisonderdrukking)
 my $cutoff_voltage      = 57.0; # Accuspanning waarbij laden stopt (V)
 my $lat                 = 51.7073;
@@ -204,27 +207,44 @@ sub pid_calculate {
     my $now = time();
     my $dt  = $now - $pid_last_time;
 
-    # Minimale tijdstap: voorkom deling door nul en extreme D-waarden
-    # bij berichten die te snel achter elkaar komen.
-    $dt = 0.1 if $dt < 0.1;
+    # Tijdstap begrenzen: minimaal 0.1s (geen deling door nul),
+    # maximaal DT_MAX (voorkomt dat een deadband-cyclus de integraal verdubbelt).
+    $dt = 0.1    if $dt < 0.1;
+    $dt = $DT_MAX if $dt > $DT_MAX;
 
     # ── P-term ────────────────────────────────────────────────────────────────
+    # Teken: error > 0 = verbruik van net  → méér laden  → positieve uitgang
+    #        error < 0 = export naar net   → minder laden → negatieve uitgang
+    # Zelfde tekenconventie als het originele script: uitgang = -1 * error * KP
     my $p_term = -$KP * $error;
-    $dt = $DT_MAX if $dt > $DT_MAX;
-    # ── I-term (met anti-windup) ───────────────────────────────────────────────
-    if ($charger_is_on) {
-    	$pid_integral += $error * $dt;
-    }
-    $pid_integral  = clamp($pid_integral, -$INTEGRAL_MAX / $KI, $INTEGRAL_MAX / $KI);
-    my $i_term     = -$KI * $pid_integral;
 
     # ── D-term (op error-verandering, niet op setpoint-sprong) ────────────────
     my $d_error = ($error - $pid_last_error) / $dt;
     my $d_term  = -$KD * $d_error;
 
-    # ── Totale uitgang ─────────────────────────────────────────────────────────
-    # error > 0 = we verbruiken van net → lader moet meer stroom leveren → positief
-    # error < 0 = we exporteren        → lader moet minder            → negatief
+    # ── Totale uitgang (zonder I, voor clamping-check) ────────────────────────
+    my $i_term_prev = -$KI * $pid_integral;
+    my $output_unclamped = $p_term + $i_term_prev + $d_term;
+
+    # ── I-term met clamping anti-windup ───────────────────────────────────────
+    # Integraal bijwerken alleen als:
+    #   1. lader aan is (geen windup terwijl lader uit staat)
+    #   2. uitgang NIET geclampt is, OF integraal beweegt in tegengestelde richting
+    #      (d.w.z. helpt terugkeren naar setpoint, niet verder weg)
+    #
+    # Dit voorkomt dat de integraal volloopt tijdens de ramp-up terwijl
+    # MAX_STEP_AMP de uitgang toch al begrenst.
+    my $output_clamped = ($output_unclamped > $MAX_STEP_AMP || $output_unclamped < -$MAX_STEP_AMP);
+    my $integral_same_dir = ($output_unclamped > 0 && $error < 0)
+                         || ($output_unclamped < 0 && $error > 0);
+
+    if ($charger_is_on && !($output_clamped && $integral_same_dir)) {
+        $pid_integral += $error * $dt;
+        $pid_integral  = clamp($pid_integral, -$INTEGRAL_MAX / $KI, $INTEGRAL_MAX / $KI);
+    }
+    my $i_term = -$KI * $pid_integral;
+
+    # ── Totale uitgang ────────────────────────────────────────────────────────
     my $output = $p_term + $i_term + $d_term;
 
     log_status(sprintf
