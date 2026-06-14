@@ -1,5 +1,5 @@
 #! /usr/bin/env perl
-
+ 
 use strict;
 use warnings;
 use Net::MQTT::Simple;
@@ -38,29 +38,24 @@ my $topic_fan_auto          = "r4850g2-mqtt/button/17_fan_auto_mode_button/comma
 #  Positieve error = we verbruiken van het net → meer laden.
 #  Negatieve error = we leveren terug → minder laden.
 #
-#  KP  — Proportioneel: directe reactie op de afwijking.
+#  KP  — Proportioneel: directe reactie op de afwijking (smoothed).
 #         100 W afwijking × 0.010 = 1.0 A aanpassing.
 #
 #  KI  — Integraal: corrigeert aanhoudende kleine afwijking (steady-state fout).
-#         Elke seconde dat er een afwijking is, wordt 0.002 A/W opgebouwd.
 #         Te hoog → oscillatie; te laag → trage correctie.
 #
-#  KD  — Differentiaal: dempt snelle veranderingen (bijv. plotse bewolking).
-#         Reageert op de veranderingssnelheid van de error, NIET op de error zelf.
-#         0.005 A per W/s verandering.
-#         Te hoog → gevoelig voor ruis; gebruik smoothing om dat te beperken.
-#
-#  Aanbevolen startwaarden voor dit systeem (pas aan op basis van gedrag):
-#    KP = 0.010   KI = 0.002   KD = 0.005
+#  KD  — Differentiaal: remt overshoot door te reageren op de veranderingssnelheid.
+#         Berekend op de RUWE (ongemiddelde) waarde zodat hij snel genoeg reageert
+#         om de P-term te kunnen counteren vóór het setpoint overschreden wordt.
+#         Te hoog → gevoelig voor ruis.
 
 my $KP             = 0.010;   # Proportionele versterking  (A per W)
 my $KI             = 0.0002;  # Integrale versterking      (A per W·s)
-                               #   Was 0.002 → bij 200W/10s gaf dat 4A/stap (te snel)
-                               #   Nu  0.0002 → 200W/10s = 0.4A/stap (stabiel)
-my $KD             = 0.002;   # Differentiële versterking  (A per W/s)
-                               #   Verlaagd: D had weinig effect maar versterkte ruis
+my $KD             = 0.020;   # Differentiële versterking  (A per W/s)
+                               #   Was 0.002 → D-term was verwaarloosbaar (60× kleiner dan P)
+                               #   Nu  0.020 → D-term kan overshoot actief remmen
 
-# ── Overige regelparameters ──────────────────────────────────────────────
+# ── Overige regelparameters ───────────────────────────────────────────────────
 
 my $TARGET_HOUSE_POWER  = 0;    # Doel: netto huisverbruik (W)
 my $DEADBAND_WATT       = 50;   # Dode zone: binnen ±50 W geen actie
@@ -68,9 +63,8 @@ my $MAX_STEP_AMP        = 2.0;  # Max. stroomwijziging per stap (anti-oscillatie
 my $MAX_AMP             = 39;   # Maximale laadstroom (A)
 my $MIN_AMP_SET         = 1;    # Minimale instelbare stroom (A)
 my $INTEGRAL_MAX        = 5.0;  # Anti-windup: integraalterm begrensd op ±5 A
-                                 #   Was ±10A: te groot, liet integraal te ver ophopen
 my $DT_MAX              = 12.0; # Max. dt voor integraalberekening (seconden)
-                                 #   Voorkomt dat een deadband-cyclus de dt verdubbelt
+                                 #   Voorkomt dat een deadband-cyclus de integraal verdubbelt
 my $SMOOTH_SAMPLES      = 3;    # Voortschrijdend gemiddelde (ruisonderdrukking)
 my $cutoff_voltage      = 57.0; # Accuspanning waarbij laden stopt (V)
 my $lat                 = 51.7073;
@@ -89,14 +83,15 @@ my $inv_setpoint        = 0;
 my $last_amp_set        = $MIN_AMP_SET;
 my $charger_is_on       = 0;
 my $shutdown_flag       = 0;
-my $charger_temperature = 0.0;  # Lader temperatuur (°C)
-my $fan_full            = 0;    # 1 = ventilator op vol toeren
+my $charger_temperature = 0.0;
+my $fan_full            = 0;
 
 # ── PID-toestandsvariabelen ───────────────────────────────────────────────────
 
-my $pid_integral        = 0.0;  # Opgebouwde integraalterm (A)
-my $pid_last_error      = 0.0;  # Error van vorige stap (voor D-term)
-my $pid_last_time       = time(); # Tijdstip vorige stap (voor dt)
+my $pid_integral        = 0.0;   # Opgebouwde integraalterm
+my $pid_last_error      = 0.0;   # Smoothed error vorige stap (voor logging)
+my $pid_last_raw        = 0.0;   # Ruwe error vorige stap (voor D-term)
+my $pid_last_time       = time();
 
 # ── Smoothing-buffer (voortschrijdend gemiddelde op Power_curr) ───────────────
 
@@ -138,8 +133,6 @@ sub turn_off_charger {
         $mqtt->publish($topic_output => $MIN_AMP_SET);
         $last_amp_set  = $MIN_AMP_SET;
         $charger_is_on = 0;
-        # PID alleen resetten bij daadwerkelijk uitschakelen,
-        # niet bij elke aanroep als de lader al uit is.
         _reset_pid();
     }
 }
@@ -156,8 +149,9 @@ sub turn_on_charger {
 sub _reset_pid {
     $pid_integral   = 0.0;
     $pid_last_error = 0.0;
+    $pid_last_raw   = 0.0;   # ook ruwe D-term toestand resetten
     $pid_last_time  = time();
-    log_status("PID reset: integraal en vorige error gewist.");
+    log_status("PID reset: integraal en vorige errors gewist.");
 }
 
 sub make_clean_exit {
@@ -200,41 +194,43 @@ sub fan_auto {
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. PID-REGELAAR
 # ══════════════════════════════════════════════════════════════════════════════
+#
+#  pid_calculate($smoothed_error, $raw_error)
+#
+#  P en I werken op de smoothed error: stabiel, ruisarm.
+#  D werkt op de ruwe error: reageert snel genoeg om overshoot te remmen
+#  vóórdat het gemiddelde de omslag al heeft doorgegeven.
 
 sub pid_calculate {
-    my ($error) = @_;
+    my ($error, $raw_error) = @_;
 
     my $now = time();
     my $dt  = $now - $pid_last_time;
 
-    # Tijdstap begrenzen: minimaal 0.1s (geen deling door nul),
-    # maximaal DT_MAX (voorkomt dat een deadband-cyclus de integraal verdubbelt).
+    # Tijdstap begrenzen
     $dt = 0.1    if $dt < 0.1;
     $dt = $DT_MAX if $dt > $DT_MAX;
 
-    # ── P-term ────────────────────────────────────────────────────────────────
-    # Teken: error > 0 = verbruik van net  → méér laden  → positieve uitgang
-    #        error < 0 = export naar net   → minder laden → negatieve uitgang
-    # Zelfde tekenconventie als het originele script: uitgang = -1 * error * KP
+    # ── P-term (op smoothed error) ────────────────────────────────────────────
     my $p_term = -$KP * $error;
 
-    # ── D-term (op error-verandering, niet op setpoint-sprong) ────────────────
-    my $d_error = ($error - $pid_last_error) / $dt;
-    my $d_term  = -$KD * $d_error;
+    # ── D-term (op RUWE error) ────────────────────────────────────────────────
+    # Gebruikt $raw_error zodat de D-term direct reageert op de werkelijke
+    # verandering, niet op het vertraagde gemiddelde. Dit dempt overshoot
+    # vóórdat de smoothing-buffer de omslag heeft doorgegeven aan P en I.
+    my $d_raw   = ($raw_error - $pid_last_raw) / $dt;
+    my $d_term  = -$KD * $d_raw;
 
-    # ── Totale uitgang (zonder I, voor clamping-check) ────────────────────────
-    my $i_term_prev = -$KI * $pid_integral;
+    # ── Totale uitgang zonder I (voor clamping anti-windup check) ─────────────
+    my $i_term_prev      = -$KI * $pid_integral;
     my $output_unclamped = $p_term + $i_term_prev + $d_term;
 
     # ── I-term met clamping anti-windup ───────────────────────────────────────
-    # Integraal bijwerken alleen als:
-    #   1. lader aan is (geen windup terwijl lader uit staat)
+    # Integraal alleen bijwerken als:
+    #   1. lader aan is
     #   2. uitgang NIET geclampt is, OF integraal beweegt in tegengestelde richting
-    #      (d.w.z. helpt terugkeren naar setpoint, niet verder weg)
-    #
-    # Dit voorkomt dat de integraal volloopt tijdens de ramp-up terwijl
-    # MAX_STEP_AMP de uitgang toch al begrenst.
-    my $output_clamped = ($output_unclamped > $MAX_STEP_AMP || $output_unclamped < -$MAX_STEP_AMP);
+    my $output_clamped    = ($output_unclamped >  $MAX_STEP_AMP
+                          || $output_unclamped < -$MAX_STEP_AMP);
     my $integral_same_dir = ($output_unclamped > 0 && $error < 0)
                          || ($output_unclamped < 0 && $error > 0);
 
@@ -248,13 +244,14 @@ sub pid_calculate {
     my $output = $p_term + $i_term + $d_term;
 
     log_status(sprintf
-        "PID: error=%+.1fW  dt=%.2fs  " .
+        "PID: error=%+.1fW (ruw=%+.1fW)  dt=%.2fs  " .
         "P=%+.3fA  I=%+.3fA (integraal=%.2f)  D=%+.3fA  uitgang=%+.3fA",
-        $error, $dt, $p_term, $i_term, $pid_integral, $d_term, $output
+        $error, $raw_error, $dt, $p_term, $i_term, $pid_integral, $d_term, $output
     );
 
     # Bewaar toestand voor volgende stap
     $pid_last_error = $error;
+    $pid_last_raw   = $raw_error;
     $pid_last_time  = $now;
 
     return $output;
@@ -284,9 +281,10 @@ sub regulate_charger {
         $charger_voltage, $charger_temperature, $inv_setpoint
     );
 
-    # ── Smoothed huisverbruik ─────────────────────────────────────────────────
+    # ── Smoothed en ruwe error ─────────────────────────────────────────────────
     my $smoothed_power = buf_avg(\@power_buf);
-    my $error = $smoothed_power - $TARGET_HOUSE_POWER;
+    my $error          = $smoothed_power       - $TARGET_HOUSE_POWER;
+    my $raw_error      = $current_house_power  - $TARGET_HOUSE_POWER;
     log_status(sprintf
         "Huisverbruik: ruw=%.0fW  gemiddeld=%.0fW  error=%+.0fW",
         $current_house_power, $smoothed_power, $error
@@ -295,9 +293,6 @@ sub regulate_charger {
     # ── Deadband ──────────────────────────────────────────────────────────────
     if (abs($error) <= $DEADBAND_WATT) {
         log_status("Binnen deadband (±${DEADBAND_WATT}W) — geen regelactie.");
-        # Lader uitschakelen alleen als hij aan is maar geen noemenswaardig
-        # vermogen levert (bijv. net opgestart of net onder minimumgrens).
-        # Als de lader gewoon laadt (AC > 50W), laten we hem met rust.
         if ($charger_is_on && $charger_ac_power < 50) {
             log_status("Lader aan maar nauwelijks actief (${charger_ac_power}W) → UIT.");
             turn_off_charger($mqtt);
@@ -305,8 +300,8 @@ sub regulate_charger {
         return;
     }
 
-    # ── PID berekening ─────────────────────────────────────────────────────────
-    my $pid_output = pid_calculate($error);
+    # ── PID berekening — smoothed error voor P+I, ruwe error voor D ───────────
+    my $pid_output = pid_calculate($error, $raw_error);
 
     # ── Staplimiet ────────────────────────────────────────────────────────────
     my $step = clamp($pid_output, -$MAX_STEP_AMP, $MAX_STEP_AMP);
@@ -316,7 +311,7 @@ sub regulate_charger {
 
     # ── Nieuwe stroom ──────────────────────────────────────────────────────────
     my $new_amp = clamp($last_amp_set + $step, $MIN_AMP_SET, $MAX_AMP);
-    $new_amp    = int($new_amp + 0.5);  # Afronden naar hele ampère
+    $new_amp    = int($new_amp + 0.5);
 
     # ── Zon- en voltage-controles ─────────────────────────────────────────────
     my $dt_now  = DateTime->now(time_zone => 'Europe/Amsterdam');
@@ -337,13 +332,11 @@ sub regulate_charger {
             ($voltage_full ? "accu vol (${charger_voltage}V >= ${cutoff_voltage}V). "  : "") .
             ($no_sun       ? "buiten zonuren. "                                         : "")
         );
-        turn_off_charger($mqtt);  # reset PID ook
+        turn_off_charger($mqtt);
         return;
     }
 
-    # ── Anti-windup: begrens integraal als output al geclamped is ─────────────
-    # Als we op MAX_AMP zitten en de error is nog steeds positief (of andersom),
-    # stop dan met het ophopen van de integraal.
+    # ── Anti-windup op ampère-grenzen ─────────────────────────────────────────
     if ($new_amp >= $MAX_AMP && $error > 0) {
         $pid_integral = clamp($pid_integral, -$INTEGRAL_MAX / $KI, 0);
         log_status("Anti-windup: op MAX_AMP, integraal niet verder ophogen.");
