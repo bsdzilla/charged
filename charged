@@ -139,7 +139,8 @@ sub _reset_pid {
     $pid_last_error = 0.0;
     $pid_last_raw   = 0.0;
     $pid_last_time  = time();
-    log_status("PID reset: integraal en vorige errors gewist.");
+    @power_buf	    = ();
+    log_status("PID reset: integraal en vorige errorsi en smoothing-buffer  gewist.");
 }
 
 sub make_clean_exit {
@@ -281,7 +282,7 @@ sub regulate_charger {
     #  bij een plotselinge verbruiker die wegvalt of de lader in teruglevering
     #  duwt. We slaan de PID deze cyclus over en resetten de integraal zodat
     #  de PID daarna met een schone lei verder regelt.
-    if ($charger_is_on && fast_ramp_down_needed()) {
+    if ($charger_is_on && $last_amp_set > $MIN_AMP_SET && fast_ramp_down_needed()) {
         my $new_amp = clamp($last_amp_set - $FAST_RAMP_DOWN_STEP, $MIN_AMP_SET, $MAX_AMP);
         $new_amp    = int($new_amp + 0.5);
         log_status(sprintf
