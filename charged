@@ -11,8 +11,6 @@ use List::Util    qw(min max sum);
 use Time::HiRes   qw(time);
 use Scalar::Util  qw(looks_like_number);
 
-# Signaalafhandeling via %SIG (ingesteld na initialisatie van $mqtt)
-
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. CONFIGURATIE & REGELPARAMETERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -33,47 +31,39 @@ my $topic_fan_full          = "r4850g2-mqtt/button/16_fan_full_speed_button/comm
 my $topic_fan_auto          = "r4850g2-mqtt/button/17_fan_auto_mode_button/command";
 
 # ── PID-regelparameters ───────────────────────────────────────────────────────
-#
-#  Doel: houd Power_curr op TARGET_HOUSE_POWER (0 W).
-#  Positieve error = we verbruiken van het net → meer laden.
-#  Negatieve error = we leveren terug → minder laden.
-#
-#  KP  — Proportioneel: directe reactie op de afwijking (smoothed).
-#         100 W afwijking × 0.010 = 1.0 A aanpassing.
-#
-#  KI  — Integraal: corrigeert aanhoudende kleine afwijking (steady-state fout).
-#         Te hoog → oscillatie; te laag → trage correctie.
-#
-#  KD  — Differentiaal: remt overshoot door te reageren op de veranderingssnelheid.
-#         Berekend op de RUWE (ongemiddelde) waarde zodat hij snel genoeg reageert
-#         om de P-term te kunnen counteren vóór het setpoint overschreden wordt.
-#         Te hoog → gevoelig voor ruis.
-
-my $KP             = 0.010;   # Proportionele versterking  (A per W)
-my $KI             = 0.0002;  # Integrale versterking      (A per W·s)
-my $KD             = 0.020;   # Differentiële versterking  (A per W/s)
-                               #   Was 0.002 → D-term was verwaarloosbaar (60× kleiner dan P)
-                               #   Nu  0.020 → D-term kan overshoot actief remmen
+my $KP             = 0.010;
+my $KI             = 0.0002;
+my $KD             = 0.020;
 
 # ── Overige regelparameters ───────────────────────────────────────────────────
+my $TARGET_HOUSE_POWER       = 0;
+my $DEADBAND_WATT            = 50;
+my $MAX_STEP_AMP             = 2.0;
+my $MAX_AMP                  = 39;
+my $MIN_AMP_SET              = 1;
+my $INTEGRAL_MAX             = 5.0;
+my $DT_MAX                   = 12.0;
+my $SMOOTH_SAMPLES           = 3;
+my $cutoff_voltage           = 57.0;
+my $lat                      = 51.7073;
+my $long                     = 6.07519;
+my $FAN_FULL_THRESHOLD       = 35;
+my $FAN_AUTO_THRESHOLD       = 33;
 
-my $TARGET_HOUSE_POWER  = 0;    # Doel: netto huisverbruik (W)
-my $DEADBAND_WATT       = 50;   # Dode zone: binnen ±50 W geen actie
-my $MAX_STEP_AMP        = 2.0;  # Max. stroomwijziging per stap (anti-oscillatie)
-my $MAX_AMP             = 39;   # Maximale laadstroom (A)
-my $MIN_AMP_SET         = 1;    # Minimale instelbare stroom (A)
-my $INTEGRAL_MAX        = 5.0;  # Anti-windup: integraalterm begrensd op ±5 A
-my $DT_MAX              = 12.0; # Max. dt voor integraalberekening (seconden)
-                                 #   Voorkomt dat een deadband-cyclus de integraal verdubbelt
-my $SMOOTH_SAMPLES      = 3;    # Voortschrijdend gemiddelde (ruisonderdrukking)
-my $cutoff_voltage      = 57.0; # Accuspanning waarbij laden stopt (V)
-my $lat                 = 51.7073;
-my $long                = 6.07519;
-my $FAN_FULL_THRESHOLD  = 35;   # Boven deze temperatuur (°C) → ventilator vol toeren
-my $FAN_AUTO_THRESHOLD  = 33;   # Onder deze temperatuur (°C) → ventilator auto (2°C hysterese)
+# ── Fast ramp down ────────────────────────────────────────────────────────────
+#
+#  Als de RUWE Power_curr (zonder smoothing) onder deze drempel zakt,
+#  wordt de laadstroom direct met $FAST_RAMP_DOWN_STEP verlaagd,
+#  buiten de PID om. Dit voorkomt dat de smoothing-buffer de reactie
+#  vertraagt bij een plotselinge grote verbruiker.
+#
+#  Drempel negatief: negatieve Power_curr = teruglevering aan net.
+#  Kies ruim genoeg om normale PID-overshoot niet te triggeren.
+
+my $FAST_RAMP_DOWN_THRESHOLD = -200;  # W  (ruwe teruglevering)
+my $FAST_RAMP_DOWN_STEP      = 8.0;   # A  per stap
 
 # ── Globale statusvariabelen ──────────────────────────────────────────────────
-
 my $current_house_power = 0;
 my $charger_ac_power    = 0;
 my $charger_dc_power    = 0;
@@ -87,14 +77,12 @@ my $charger_temperature = 0.0;
 my $fan_full            = 0;
 
 # ── PID-toestandsvariabelen ───────────────────────────────────────────────────
-
-my $pid_integral        = 0.0;   # Opgebouwde integraalterm
-my $pid_last_error      = 0.0;   # Smoothed error vorige stap (voor logging)
-my $pid_last_raw        = 0.0;   # Ruwe error vorige stap (voor D-term)
+my $pid_integral        = 0.0;
+my $pid_last_error      = 0.0;
+my $pid_last_raw        = 0.0;
 my $pid_last_time       = time();
 
-# ── Smoothing-buffer (voortschrijdend gemiddelde op Power_curr) ───────────────
-
+# ── Smoothing-buffer ──────────────────────────────────────────────────────────
 my @power_buf;
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -149,7 +137,7 @@ sub turn_on_charger {
 sub _reset_pid {
     $pid_integral   = 0.0;
     $pid_last_error = 0.0;
-    $pid_last_raw   = 0.0;   # ook ruwe D-term toestand resetten
+    $pid_last_raw   = 0.0;
     $pid_last_time  = time();
     log_status("PID reset: integraal en vorige errors gewist.");
 }
@@ -173,7 +161,6 @@ sub make_clean_exit {
 sub regulate_fan {
     my ($mqtt) = @_;
     my $temp = $charger_temperature;
-
     if (!$fan_full && $temp > $FAN_FULL_THRESHOLD) {
         log_status(sprintf "Temp %.1f°C > %d°C → Ventilator VOL TOEREN.", $temp, $FAN_FULL_THRESHOLD);
         $mqtt->publish($topic_fan_full => 'PRESS');
@@ -191,44 +178,36 @@ sub fan_auto {
     $fan_full = 0;
 }
 
+# ── Fast ramp down check ──────────────────────────────────────────────────────
+#
+#  Gebaseerd op de RUWE (ongesmoothed) waarde, zodat de smoothing-buffer
+#  de detectie niet vertraagt.
+
+sub fast_ramp_down_needed {
+    my $raw_error = $current_house_power - $TARGET_HOUSE_POWER;
+    return $raw_error < $FAST_RAMP_DOWN_THRESHOLD;
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. PID-REGELAAR
 # ══════════════════════════════════════════════════════════════════════════════
-#
-#  pid_calculate($smoothed_error, $raw_error)
-#
-#  P en I werken op de smoothed error: stabiel, ruisarm.
-#  D werkt op de ruwe error: reageert snel genoeg om overshoot te remmen
-#  vóórdat het gemiddelde de omslag al heeft doorgegeven.
 
 sub pid_calculate {
     my ($error, $raw_error) = @_;
 
     my $now = time();
     my $dt  = $now - $pid_last_time;
-
-    # Tijdstap begrenzen
     $dt = 0.1    if $dt < 0.1;
     $dt = $DT_MAX if $dt > $DT_MAX;
 
-    # ── P-term (op smoothed error) ────────────────────────────────────────────
     my $p_term = -$KP * $error;
 
-    # ── D-term (op RUWE error) ────────────────────────────────────────────────
-    # Gebruikt $raw_error zodat de D-term direct reageert op de werkelijke
-    # verandering, niet op het vertraagde gemiddelde. Dit dempt overshoot
-    # vóórdat de smoothing-buffer de omslag heeft doorgegeven aan P en I.
     my $d_raw   = ($raw_error - $pid_last_raw) / $dt;
     my $d_term  = -$KD * $d_raw;
 
-    # ── Totale uitgang zonder I (voor clamping anti-windup check) ─────────────
     my $i_term_prev      = -$KI * $pid_integral;
     my $output_unclamped = $p_term + $i_term_prev + $d_term;
 
-    # ── I-term met clamping anti-windup ───────────────────────────────────────
-    # Integraal alleen bijwerken als:
-    #   1. lader aan is
-    #   2. uitgang NIET geclampt is, OF integraal beweegt in tegengestelde richting
     my $output_clamped    = ($output_unclamped >  $MAX_STEP_AMP
                           || $output_unclamped < -$MAX_STEP_AMP);
     my $integral_same_dir = ($output_unclamped > 0 && $error < 0)
@@ -240,7 +219,6 @@ sub pid_calculate {
     }
     my $i_term = -$KI * $pid_integral;
 
-    # ── Totale uitgang ────────────────────────────────────────────────────────
     my $output = $p_term + $i_term + $d_term;
 
     log_status(sprintf
@@ -249,7 +227,6 @@ sub pid_calculate {
         $error, $raw_error, $dt, $p_term, $i_term, $pid_integral, $d_term, $output
     );
 
-    # Bewaar toestand voor volgende stap
     $pid_last_error = $error;
     $pid_last_raw   = $raw_error;
     $pid_last_time  = $now;
@@ -266,168 +243,5 @@ sub regulate_charger {
 
     # ── Blokkeer laden als inverter teruglevering uit accu doet ───────────────
     if ($inv_setpoint > 0) {
-        log_status("Inverter teruglevering actief ($inv_setpoint W) → lader UIT.");
-        turn_off_charger($mqtt);
-        return;
-    }
+        log_status("Inverter teruglevering actief ($inv_setpoint W)
 
-    # ── Efficiëntie (voor logging) ─────────────────────────────────────────────
-    my $efficiency = ($charger_ac_power > 0 && $charger_dc_power > 0)
-        ? min(1.0, $charger_dc_power / $charger_ac_power)
-        : 1.0;
-    log_status(sprintf
-        "Status: eff=%.3f  AC=%.0fW  DC=%.0fW  U=%.1fV  temp=%.1f°C  inv=%.0fW",
-        $efficiency, $charger_ac_power, $charger_dc_power,
-        $charger_voltage, $charger_temperature, $inv_setpoint
-    );
-
-    # ── Smoothed en ruwe error ─────────────────────────────────────────────────
-    my $smoothed_power = buf_avg(\@power_buf);
-    my $error          = $smoothed_power       - $TARGET_HOUSE_POWER;
-    my $raw_error      = $current_house_power  - $TARGET_HOUSE_POWER;
-    log_status(sprintf
-        "Huisverbruik: ruw=%.0fW  gemiddeld=%.0fW  error=%+.0fW",
-        $current_house_power, $smoothed_power, $error
-    );
-
-    # ── Deadband ──────────────────────────────────────────────────────────────
-    if (abs($error) <= $DEADBAND_WATT) {
-        log_status("Binnen deadband (±${DEADBAND_WATT}W) — geen regelactie.");
-        if ($charger_is_on && $charger_ac_power < 50) {
-            log_status("Lader aan maar nauwelijks actief (${charger_ac_power}W) → UIT.");
-            turn_off_charger($mqtt);
-        }
-        return;
-    }
-
-    # ── PID berekening — smoothed error voor P+I, ruwe error voor D ───────────
-    my $pid_output = pid_calculate($error, $raw_error);
-
-    # ── Staplimiet ────────────────────────────────────────────────────────────
-    my $step = clamp($pid_output, -$MAX_STEP_AMP, $MAX_STEP_AMP);
-    if (abs($pid_output) > $MAX_STEP_AMP) {
-        log_status(sprintf "Staplimiet: PID=%.3fA begrensd tot %.1fA.", $pid_output, $step);
-    }
-
-    # ── Nieuwe stroom ──────────────────────────────────────────────────────────
-    my $new_amp = clamp($last_amp_set + $step, $MIN_AMP_SET, $MAX_AMP);
-    $new_amp    = int($new_amp + 0.5);
-
-    # ── Zon- en voltage-controles ─────────────────────────────────────────────
-    my $dt_now  = DateTime->now(time_zone => 'Europe/Amsterdam');
-    my $sun     = DateTime::Event::Sunrise->new(
-        longitude => $long, latitude => $lat, precise => 1
-    );
-    my $sunrise = $sun->sunrise_datetime($dt_now);
-    my $sunset  = $sun->sunset_datetime($dt_now);
-
-    my $below_min    = $new_amp <= $MIN_AMP_SET;
-    my $voltage_full = $charger_voltage >= $cutoff_voltage;
-    my $no_sun       = ($dt_now < $sunrise || $dt_now > $sunset);
-
-    if ($below_min || $voltage_full || $no_sun) {
-        log_status(
-            "Lader UIT: " .
-            ($below_min    ? "stroom te laag (${new_amp}A). "                          : "") .
-            ($voltage_full ? "accu vol (${charger_voltage}V >= ${cutoff_voltage}V). "  : "") .
-            ($no_sun       ? "buiten zonuren. "                                         : "")
-        );
-        turn_off_charger($mqtt);
-        return;
-    }
-
-    # ── Anti-windup op ampère-grenzen ─────────────────────────────────────────
-    if ($new_amp >= $MAX_AMP && $error > 0) {
-        $pid_integral = clamp($pid_integral, -$INTEGRAL_MAX / $KI, 0);
-        log_status("Anti-windup: op MAX_AMP, integraal niet verder ophogen.");
-    }
-    elsif ($new_amp <= $MIN_AMP_SET && $error < 0) {
-        $pid_integral = clamp($pid_integral, 0, $INTEGRAL_MAX / $KI);
-        log_status("Anti-windup: op MIN_AMP, integraal niet verder verlagen.");
-    }
-
-    # ── Lader AAN en publiceren ────────────────────────────────────────────────
-    turn_on_charger($mqtt);
-
-    if ($new_amp != $last_amp_set) {
-        log_status("Laadstroom: ${last_amp_set}A → ${new_amp}A.");
-        $mqtt->publish($topic_output => $new_amp);
-        $last_amp_set = $new_amp;
-    } else {
-        log_status("Laadstroom ongewijzigd: ${last_amp_set}A.");
-    }
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 5. MQTT DAEMON LOOP
-# ══════════════════════════════════════════════════════════════════════════════
-
-my $mqtt = Net::MQTT::Simple->new($mqtt_host);
-log_status("Verbonden met MQTT-broker op $mqtt_host.");
-
-$mqtt->last_will($topic_off => '1');
-
-my $exit_handler = make_clean_exit($mqtt);
-$SIG{INT}  = $exit_handler;
-$SIG{TERM} = $exit_handler;
-
-$mqtt->subscribe(
-
-    $topic_input => sub {
-        my ($topic, $message) = @_;
-        eval {
-            my $json = decode_json($message);
-            my $power = $json->{LK13BE}{Power_curr};
-            if (defined $power && looks_like_number($power)) {
-                $current_house_power = $power + 0;
-                push_smooth(\@power_buf, $current_house_power);
-                regulate_charger($mqtt);
-            } else {
-                log_status("Fout: kon Power_curr niet parsen.", \$json);
-            }
-        };
-        log_status("JSON-decodefout: $@") if $@;
-    },
-
-    $topic_ac_power => sub {
-        my (undef, $msg) = @_;
-        $charger_ac_power = $msg + 0 if looks_like_number($msg);
-    },
-
-    $topic_dc_power => sub {
-        my (undef, $msg) = @_;
-        $charger_dc_power = $msg + 0 if looks_like_number($msg);
-    },
-
-    $topic_voltage => sub {
-        my (undef, $msg) = @_;
-        $charger_voltage = $msg + 0 if looks_like_number($msg);
-    },
-
-    $topic_inverter_power => sub {
-        my (undef, $msg) = @_;
-        $inv_power = $msg + 0 if looks_like_number($msg);
-    },
-
-    $topic_inverter_setpoint => sub {
-        my (undef, $msg) = @_;
-        return unless looks_like_number($msg);
-        my $prev = $inv_setpoint;
-        $inv_setpoint = $msg + 0;
-        log_status("Inverter setpoint: ${prev}W → ${inv_setpoint}W.")
-            if $prev != $inv_setpoint;
-    },
-
-    $topic_temperature => sub {
-        my (undef, $msg) = @_;
-        return unless looks_like_number($msg);
-        $charger_temperature = $msg + 0;
-        regulate_fan($mqtt);
-    },
-
-);
-
-log_status("Start MQTT-luisterlus...");
-$mqtt->run();
-
-1;
