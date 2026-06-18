@@ -62,6 +62,7 @@ my $FAN_AUTO_THRESHOLD       = 33;
 
 my $FAST_RAMP_DOWN_THRESHOLD = -200;  # W  (ruwe teruglevering)
 my $FAST_RAMP_DOWN_STEP      = 8.0;   # A  per stap
+my $FAST_RAMP_DOWN_MIN_AMP   =10;
 
 # ── Globale statusvariabelen ──────────────────────────────────────────────────
 my $current_house_power = 0;
@@ -282,7 +283,7 @@ sub regulate_charger {
     #  bij een plotselinge verbruiker die wegvalt of de lader in teruglevering
     #  duwt. We slaan de PID deze cyclus over en resetten de integraal zodat
     #  de PID daarna met een schone lei verder regelt.
-    if ($charger_is_on && $last_amp_set > $MIN_AMP_SET && fast_ramp_down_needed()) {
+    if ($charger_is_on && $last_amp_set > $FAST_RAMP_DOWN_MIN_AMP && fast_ramp_down_needed()) {
         my $new_amp = clamp($last_amp_set - $FAST_RAMP_DOWN_STEP, $MIN_AMP_SET, $MAX_AMP);
         $new_amp    = int($new_amp + 0.5);
         log_status(sprintf
