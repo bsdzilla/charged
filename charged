@@ -63,6 +63,7 @@ my $FAN_AUTO_THRESHOLD       = 33;
 my $FAST_RAMP_DOWN_THRESHOLD = -200;  # W  (ruwe teruglevering)
 my $FAST_RAMP_DOWN_STEP      = 8.0;   # A  per stap
 my $FAST_RAMP_DOWN_MIN_AMP   =10;
+my $FAST_RAMP_DOWN_MIN_WORSEN   = 100;  # W: situatie moet minstens 100W verslechteren
 
 # ── Globale statusvariabelen ──────────────────────────────────────────────────
 my $current_house_power = 0;
@@ -76,6 +77,7 @@ my $charger_is_on       = 0;
 my $shutdown_flag       = 0;
 my $charger_temperature = 0.0;
 my $fan_full            = 0;
+my $prev_raw_power = 0;   # voor fast ramp down trend-check
 
 # ── PID-toestandsvariabelen ───────────────────────────────────────────────────
 my $pid_integral        = 0.0;
@@ -187,7 +189,10 @@ sub fan_auto {
 
 sub fast_ramp_down_needed {
     my $raw_error = $current_house_power - $TARGET_HOUSE_POWER;
-    return $raw_error < $FAST_RAMP_DOWN_THRESHOLD;
+    # Alleen triggeren als de situatie verslechtert (of gelijkblijft),
+    # niet als de PID al aan het verbeteren is.
+    my $worsening = $current_house_power < ($prev_raw_power - $FAST_RAMP_DOWN_MIN_WORSEN);
+    return $raw_error < $FAST_RAMP_DOWN_THRESHOLD && $worsening;
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -279,18 +284,20 @@ sub regulate_charger {
 
     # ── Fast ramp down: plotselinge grote teruglevering → direct reduceren ────
     #
-    #  Check op de RUWE waarde, want de smoothing-buffer reageert te traag
-    #  bij een plotselinge verbruiker die wegvalt of de lader in teruglevering
-    #  duwt. We slaan de PID deze cyclus over en resetten de integraal zodat
-    #  de PID daarna met een schone lei verder regelt.
     if ($charger_is_on && $last_amp_set > $FAST_RAMP_DOWN_MIN_AMP && fast_ramp_down_needed()) {
         my $new_amp = clamp($last_amp_set - $FAST_RAMP_DOWN_STEP, $MIN_AMP_SET, $MAX_AMP);
         $new_amp    = int($new_amp + 0.5);
         log_status(sprintf
-            "FAST RAMP DOWN: ruw=%.0fW < %dW drempel → stroom %dA → %dA.",
+            "FAST RAMP DOWN: ruw=%.0fW < %dW drempel én %.0fW slechter dan vorige meting (%.0fW) → stroom %dA → %dA.",
             $current_house_power, $FAST_RAMP_DOWN_THRESHOLD,
+            $current_house_power - $prev_raw_power, $prev_raw_power,
             $last_amp_set, $new_amp
         );
+        $mqtt->publish($topic_output => $new_amp);
+        $last_amp_set = $new_amp;
+        _reset_pid();
+        return;
+    }
         $mqtt->publish($topic_output => $new_amp);
         $last_amp_set = $new_amp;
         _reset_pid();
@@ -369,19 +376,20 @@ $SIG{TERM} = $exit_handler;
 $mqtt->subscribe(
 
     $topic_input => sub {
-        my ($topic, $message) = @_;
-        eval {
-            my $json = decode_json($message);
-            my $power = $json->{LK13BE}{Power_curr};
-            if (defined $power && looks_like_number($power)) {
-                $current_house_power = $power + 0;
-                push_smooth(\@power_buf, $current_house_power);
-                regulate_charger($mqtt);
-            } else {
-                log_status("Fout: kon Power_curr niet parsen.", \$json);
-            }
-        };
-        log_status("JSON-decodefout: $@") if $@;
+    my ($topic, $message) = @_;
+    eval {
+        my $json  = decode_json($message);
+        my $power = $json->{LK13BE}{Power_curr};
+        if (defined $power && looks_like_number($power)) {
+            $current_house_power = $power + 0;
+            push_smooth(\@power_buf, $current_house_power);
+            regulate_charger($mqtt);
+            $prev_raw_power = $current_house_power;  # ← ná regulate_charger
+        } else {
+            log_status("Fout: kon Power_curr niet parsen.", \$json);
+        }
+    };
+    log_status("JSON-decodefout: $@") if $@;
     },
 
     $topic_ac_power => sub {
