@@ -90,6 +90,7 @@ canbus:
                       case 0x76: id(set_max_output_current_sensor).publish_state(value); break;
                       case 0x78: id(input_grid_voltage_sensor).publish_state(value); break;
                       case 0x7F: id(output_temperature_sensor).publish_state(value); break;
+                      case 0x80: id(input_temperature_sensor).publish_state(value); break;
                       case 0x81: id(output_current_sensor).publish_state(value); break;
                     }
                     break;
@@ -243,6 +244,15 @@ sensor:
               - logger.log:
                   level: INFO
                   format: "Temperature exceeded 90°C. Sent CAN OFF message."
+  - platform: template
+    name: "08a Input Temperature"
+    id: input_temperature_sensor
+    unit_of_measurement: "°C"
+    state_class: "measurement"
+    accuracy_decimals: 1
+    filters:
+      - multiply: ${multiplier_default}
+    icon: "mdi:thermometer"
 
   - platform: template
     name: "06 Output DC Current"
