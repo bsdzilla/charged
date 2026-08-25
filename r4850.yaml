@@ -85,6 +85,7 @@ canbus:
                       case 0x71: id(grid_frequency_sensor).publish_state(value); break;
                       case 0x72: id(input_current_sensor).publish_state(value); break;
                       case 0x73: id(dc_power_out_sensor).publish_state(value); break;
+                      case 0x74: id(efficiency).publish_state(value); break;
                       case 0x75: id(output_voltage_sensor).publish_state(value); break;
                       case 0x76: id(set_max_output_current_sensor).publish_state(value); break;
                       case 0x78: id(input_grid_voltage_sensor).publish_state(value); break;
@@ -262,6 +263,15 @@ sensor:
     filters:
       - multiply: ${multiplier_current}
     icon: "mdi:current-ac"
+
+  - platform: template
+    name: "5a Efficiency"
+    id: efficiency
+    unit_of_measurement: "%"
+    filters:
+      - multiply: 0.1
+    accuracy_decimals: 1
+    icon: "mdi:counter"
 
 
 # Number input for CAN Voltage
@@ -652,7 +662,8 @@ button:
             use_extended_id: true
             can_id: 0x108080FE
             data: [0x01, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
-
+  - platform: restart
+    name: "Restart"
 # Define a button component for turning OFF
   - platform: template
     name: "002 CAN OFF Button"
